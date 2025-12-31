@@ -20,16 +20,16 @@ class OpponentPool:
         self.historical.append(copy.deepcopy(policy))
         
     def get_action(self, obs, mask, policy, env, p_idx):
-        # bootcamp: calling station
+        # bootcamp calling station
         if self.mode == "bootcamp":
-            # check/call usually. fold 5%
+            # check call usually fold 5pct
             if mask[1] == 1:
                 return 1, 0.0 # call
             elif mask[0] == 1:
                 return 0, 0.0 # fold
             return 1, 0.0
             
-        # normal: mixed strategy
+        # normal mixed strategy
         else:
             r = random.random()
             # 20% weak (call/check)
@@ -37,43 +37,36 @@ class OpponentPool:
                 if mask[1] == 1: return 1, 0.0
                 return 0, 0.0
             
-            # 20% historic self
+            # 20pct historic self
             if r < 0.4 and len(self.historical) > 0:
                 opp_policy = random.choice(self.historical)
                 with torch.no_grad():
                     c, a, _ = opp_policy.get_action(obs, mask)
                 return c, a
                 
-            # 60% current self (nash)
+            # 60pct current self nash
             with torch.no_grad():
                 c, a, _ = policy.get_action(obs, mask)
             return c, a
 
-def collect_group_trajectories(policy, fixed_card, env, opp_pool):
+def collect_group_trajectories(policy, env, opp_pool):
     trajectories = []
-    
-    # track aggression
     n_bets = 0
     n_actions = 0
     
     for _ in range(GROUP_SIZE):
-        deck = [0,0,1,1,2,2]
-        deck.remove(fixed_card)
-        random.shuffle(deck)
-        
-        env.reset([fixed_card] + deck)
+        env.reset()
         traj = []
-        curr = 0
+        curr = 0 # sb acts first preflop
         
         while not env.finished:
             obs = env.get_obs(curr)
             mask = env.get_mask(curr)
             
-            if curr == 1:
-                # use opp pool
+            if curr == 1: # opp
                 c_opp, a_opp = opp_pool.get_action(obs, mask, policy, env, curr)
                 env.step(curr, c_opp, a_opp)
-            else:
+            else: # hero
                 with torch.no_grad():
                     c_act, a_act, lp = policy.get_action(obs, mask)
                 
@@ -100,24 +93,18 @@ def train():
     opp_pool = OpponentPool()
     
     print(f"starting training on {DEVICE}")
-    print(f"config: batch={BATCH_SIZE}, group={GROUP_SIZE}, lr={LR}")
+    print("[iteration 2] nlth 1v1 | 52-card deck | 4 rounds")
     
-    for i in range(1, 5001):
+    for i in range(1, 10001):
         if i % 50 == 0:
             opp_pool.snapshot(policy)
             
-        buffer_obs = []
-        buffer_mask = []
-        buffer_cat = []
-        buffer_amt = []
-        buffer_lp = []
-        buffer_adv = []
+        buffer_obs, buffer_mask, buffer_cat, buffer_amt, buffer_lp, buffer_adv = [], [], [], [], [], []
+        total_bets, total_actions = 0, 0
         
-        total_bets = 0
-        total_actions = 0
-        
-        for card in [0,1,2]:
-            trajs, nb, na = collect_group_trajectories(policy, card, env, opp_pool)
+        # collect groups for batch size
+        for _ in range(3):
+            trajs, nb, na = collect_group_trajectories(policy, env, opp_pool)
             total_bets += nb
             total_actions += na
             
@@ -135,10 +122,10 @@ def train():
         
         # adaptive logic
         bet_ratio = total_bets / (total_actions + 1e-9)
-        if bet_ratio > 0.25: # aggressive -> normal
+        if bet_ratio > 0.25: # aggressive to normal
             opp_pool.mode = "normal"
         else:
-            opp_pool.mode = "bootcamp" # passive -> bootcamp
+            opp_pool.mode = "bootcamp" # passive to bootcamp
             
         if len(buffer_obs) < BATCH_SIZE: 
             continue

@@ -8,18 +8,19 @@ class DynamicPokerLSTM(nn.Module):
     def __init__(self):
         super().__init__()
         
-        self.static_net = nn.Sequential(nn.Linear(STATIC_DIM, 64), nn.ReLU())
-        self.lstm = nn.LSTM(1, 64, batch_first=True)
-        self.shared_fc = nn.Sequential(nn.Linear(128, 128), nn.ReLU())
+        self.static_net = nn.Sequential(nn.Linear(STATIC_DIM, 128), nn.ReLU())
+        self.lstm = nn.LSTM(1, 128, batch_first=True)
+        self.shared_fc = nn.Sequential(nn.Linear(256, 128), nn.ReLU())
         
-        # head 1: discrete category [fold, call, bet]
+        # discrete category
         self.category_head = nn.Linear(128, 3)
         
-        # head 2: continuous amount (beta params)
+        # continuous beta parameters
         self.amount_alpha = nn.Sequential(nn.Linear(128, 1), nn.Softplus())
         self.amount_beta =  nn.Sequential(nn.Linear(128, 1), nn.Softplus())
         
     def forward(self, obs, mask=None):
+        self.lstm.flatten_parameters()
         static = self.static_net(obs[:, :STATIC_DIM])
         
         hist = obs[:, STATIC_DIM:].unsqueeze(-1)
@@ -33,7 +34,7 @@ class DynamicPokerLSTM(nn.Module):
         if mask is not None:
             cat_logits = cat_logits.masked_fill(mask == 0, -1e9)
             
-        # add 1.0 to ensure valid beta shapes > 0
+        # valid beta shapes
         alpha = self.amount_alpha(latent) + 1.0
         beta = self.amount_beta(latent) + 1.0
         
@@ -55,10 +56,10 @@ class DynamicPokerLSTM(nn.Module):
         amt_dist = dist.Beta(alpha, beta)
         amt_action = amt_dist.sample()
         
-        # Stability: Clamp to avoid 0.0/1.0 boundary issues
+        # stability clamp
         amt_action = torch.clamp(amt_action, 1e-6, 1.0 - 1e-6)
         
-        # compute joint log prob
+        # joint log prob
         log_prob_cat = cat_dist.log_prob(cat_action)
         log_prob_amt = amt_dist.log_prob(amt_action).squeeze(-1)
         
