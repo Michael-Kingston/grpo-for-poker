@@ -23,6 +23,13 @@ class OpponentPool:
     def get_action(self, obs, mask, policy, env, p_idx):
         # bootcamp
         if self.mode == "bootcamp":
+            # 20% self-play mix
+            if random.random() < 0.2:
+                with torch.no_grad():
+                    c, a, _ = policy.get_action(obs, mask)
+                return c, a
+            
+            # 80% fish
             if mask[1] == 1:
                 return 1, 0.0 
             elif mask[0] == 1:
@@ -32,19 +39,19 @@ class OpponentPool:
         # normal
         else:
             r = random.random()
-            # weak
-            if r < 0.2:
+            # weak (10%)
+            if r < 0.1:
                 if mask[1] == 1: return 1, 0.0
                 return 0, 0.0
             
-            # historic
-            if r < 0.4 and len(self.historical) > 0:
+            # historic (25%)
+            if r < 0.35 and len(self.historical) > 0:
                 opp_policy = random.choice(self.historical)
                 with torch.no_grad():
                     c, a, _ = opp_policy.get_action(obs, mask)
                 return c, a
                 
-            # current
+            # current self (65%)
             with torch.no_grad():
                 c, a, _ = policy.get_action(obs, mask)
             return c, a
@@ -150,7 +157,7 @@ def train():
     print(f"starting training on {DEVICE}")
     
     for i in range(1, 10001):
-        if i == 301:
+        if i >= 201 and opp_pool.mode == "bootcamp":
             opp_pool.mode = "normal"
             print(">>> graduated to normal mode <<<")
             
