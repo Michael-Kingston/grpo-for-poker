@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from collections import namedtuple
 
-# data structure for trajectory steps
+# trajectories
 StepData = namedtuple('StepData', ['obs', 'mask', 'cat_action', 'amt_action', 'log_prob', 'reward'])
 
 def set_seed(seed):
@@ -13,8 +13,8 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 def card_to_str(card):
-    if card is None: return "None"
-    ranks = "23456789TJQKA"
+    if card is None: return "none"
+    ranks = "23456789tjqka"
     suits = "shdc"
     r, s = card // 4, card % 4
     return f"{ranks[r]}{suits[s]}"

@@ -4,6 +4,7 @@ import copy
 from collections import deque
 import random
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributions as dist
 from pokerbot.config import DEVICE, BATCH_SIZE, GROUP_SIZE, PPO_EPOCHS, CLIP_EPS, ENTROPY_COEFF, LR
@@ -14,76 +15,130 @@ from pokerbot.models import DynamicPokerLSTM
 class OpponentPool:
     def __init__(self):
         self.historical = deque(maxlen=3)
-        self.mode = "bootcamp" # start easy
+        self.mode = "bootcamp" 
         
     def snapshot(self, policy):
         self.historical.append(copy.deepcopy(policy))
         
     def get_action(self, obs, mask, policy, env, p_idx):
-        # bootcamp calling station
+        # bootcamp
         if self.mode == "bootcamp":
-            # check call usually fold 5pct
             if mask[1] == 1:
-                return 1, 0.0 # call
+                return 1, 0.0 
             elif mask[0] == 1:
-                return 0, 0.0 # fold
+                return 0, 0.0 
             return 1, 0.0
             
-        # normal mixed strategy
+        # normal
         else:
             r = random.random()
-            # 20% weak (call/check)
+            # weak
             if r < 0.2:
                 if mask[1] == 1: return 1, 0.0
                 return 0, 0.0
             
-            # 20pct historic self
+            # historic
             if r < 0.4 and len(self.historical) > 0:
                 opp_policy = random.choice(self.historical)
                 with torch.no_grad():
                     c, a, _ = opp_policy.get_action(obs, mask)
                 return c, a
                 
-            # 60pct current self nash
+            # current
             with torch.no_grad():
                 c, a, _ = policy.get_action(obs, mask)
             return c, a
 
 def collect_group_trajectories(policy, env, opp_pool):
-    trajectories = []
-    n_bets = 0
-    n_actions = 0
+    # plays until hero decision then multiverse
+    buffer = []
     
-    for _ in range(GROUP_SIZE):
-        env.reset()
-        traj = []
-        curr = 0 # sb acts first preflop
+    env.reset()
+    curr = 0 
+    
+    # until decision
+    while not env.finished:
+        obs = env.get_obs(curr)
+        mask = env.get_mask(curr)
         
-        while not env.finished:
-            obs = env.get_obs(curr)
-            mask = env.get_mask(curr)
-            
-            if curr == 1: # opp
-                c_opp, a_opp = opp_pool.get_action(obs, mask, policy, env, curr)
-                env.step(curr, c_opp, a_opp)
-            else: # hero
-                with torch.no_grad():
-                    c_act, a_act, lp = policy.get_action(obs, mask)
-                
-                n_actions += 1
-                if c_act == 2: n_bets += 1
-                
-                traj.append(StepData(obs, mask, c_act, a_act, lp, 0))
-                env.step(0, c_act, a_act)
-            
+        if curr == 0: 
+            break
+        else: 
+            c_opp, a_opp = opp_pool.get_action(obs, mask, policy, env, curr)
+            env.step(curr, c_opp, a_opp)
             curr = 1 - curr
             
-        payoff = env.get_payoff(0)
-        if traj:
-            last = traj[-1]
-            traj[-1] = StepData(last.obs, last.mask, last.cat_action, last.amt_action, last.log_prob, payoff)
-        trajectories.append(traj)
-    return trajectories, n_bets, n_actions
+    if env.finished:
+        return [] 
+        
+    # multiverse
+    snapshot = env.save_state()
+    group_results = []
+    
+    obs_b = snapshot.get_obs(0).unsqueeze(0)
+    mask_b = snapshot.get_mask(0).unsqueeze(0)
+    
+    # inference mode faster
+    with torch.inference_mode():
+        logits_b, alpha_b, beta_b = policy(obs_b, mask_b)
+        
+        # temp
+        logits_b = logits_b / max(1.5, 1e-6)
+        alpha_b = (alpha_b - 1.0) / max(1.5, 1e-6) + 1.0
+        beta_b = (beta_b - 1.0) / max(1.5, 1e-6) + 1.0
+        
+        # dists
+        cat_dist = dist.Categorical(F.softmax(logits_b, dim=-1))
+        amt_dist = dist.Beta(alpha_b, beta_b)
+        
+        # batched sampling faster
+        cat_actions = cat_dist.sample((GROUP_SIZE,)).squeeze()
+        amt_actions = amt_dist.sample((GROUP_SIZE,)).squeeze()
+        
+        # lps
+        lp_cats = cat_dist.log_prob(cat_actions).squeeze()
+        lp_amts = amt_dist.log_prob(amt_actions).squeeze()
+        is_bet_b = (cat_actions == 2).float()
+        total_lps = lp_cats + (lp_amts * is_bet_b)
+        
+    for i in range(GROUP_SIZE):
+        sim_env = snapshot.save_state()
+        
+        c_act = cat_actions[i].item()
+        a_act = amt_actions[i].item()
+        lp = total_lps[i]
+        
+        sim_env.step(0, c_act, a_act)
+        
+        p_turn = 1
+        while not sim_env.finished:
+            s_obs = sim_env.get_obs(p_turn)
+            s_mask = sim_env.get_mask(p_turn)
+            
+            if p_turn == 1: # opp
+                c_o, a_o = opp_pool.get_action(s_obs, s_mask, policy, sim_env, p_turn)
+                sim_env.step(p_turn, c_o, a_o)
+            else: # hero
+                with torch.inference_mode():
+                    c_o, a_o, _ = policy.get_action(s_obs, s_mask, temperature=1.0)
+                sim_env.step(p_turn, c_o, a_o)
+            p_turn = 1 - p_turn
+            
+        reward = sim_env.get_payoff(0)
+        group_results.append({
+            'obs': obs, 'mask': mask, 'cat': c_act, 'amt': a_act, 'lp': lp, 'reward': reward
+        })
+        
+    # advantages
+    rewards = torch.tensor([r['reward'] for r in group_results], device=DEVICE)
+    mean = rewards.mean()
+    std = rewards.std() + 1e-6
+    advantages = (rewards - mean) / std
+    
+    for i, res in enumerate(group_results):
+        buffer.append(StepData(res['obs'], res['mask'], res['cat'], res['amt'], res['lp'], advantages[i].item()))
+        
+    return buffer
 
 def train():
     set_seed(42)
@@ -93,49 +148,34 @@ def train():
     opp_pool = OpponentPool()
     
     print(f"starting training on {DEVICE}")
-    print("[iteration 2] nlth 1v1 | 52-card deck | 4 rounds")
     
     for i in range(1, 10001):
+        if i == 301:
+            opp_pool.mode = "normal"
+            print(">>> graduated to normal mode <<<")
+            
         if i % 50 == 0:
             opp_pool.snapshot(policy)
             
         buffer_obs, buffer_mask, buffer_cat, buffer_amt, buffer_lp, buffer_adv = [], [], [], [], [], []
-        total_bets, total_actions = 0, 0
         
-        # collect groups for batch size
-        for _ in range(3):
-            trajs, nb, na = collect_group_trajectories(policy, env, opp_pool)
-            total_bets += nb
-            total_actions += na
-            
-            rewards = torch.tensor([sum(s.reward for s in t) for t in trajs], device=DEVICE)
-            adv = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
-            
-            for j, t in enumerate(trajs):
-                for step in t:
-                    buffer_obs.append(step.obs)
-                    buffer_mask.append(step.mask)
-                    buffer_cat.append(step.cat_action)
-                    buffer_amt.append(step.amt_action)
-                    buffer_lp.append(step.log_prob)
-                    buffer_adv.append(adv[j])
-        
-        # adaptive logic
-        bet_ratio = total_bets / (total_actions + 1e-9)
-        if bet_ratio > 0.25: # aggressive to normal
-            opp_pool.mode = "normal"
-        else:
-            opp_pool.mode = "bootcamp" # passive to bootcamp
-            
-        if len(buffer_obs) < BATCH_SIZE: 
-            continue
+        # batching
+        while len(buffer_obs) < BATCH_SIZE:
+            trajs = collect_group_trajectories(policy, env, opp_pool)
+            for step in trajs:
+                buffer_obs.append(step.obs)
+                buffer_mask.append(step.mask)
+                buffer_cat.append(step.cat_action)
+                buffer_amt.append(step.amt_action)
+                buffer_lp.append(step.log_prob)
+                buffer_adv.append(step.reward) 
         
         t_obs = torch.stack(buffer_obs)
         t_mask = torch.stack(buffer_mask)
         t_cat = torch.tensor(buffer_cat, device=DEVICE)
         t_amt = torch.tensor(buffer_amt, device=DEVICE).unsqueeze(-1)
         t_old_lp = torch.stack(buffer_lp).detach()
-        t_adv = torch.stack(buffer_adv).detach()
+        t_adv = torch.tensor(buffer_adv, device=DEVICE).detach()
         
         for _ in range(PPO_EPOCHS):
             cat_logits, alpha, beta = policy(t_obs, t_mask)
@@ -165,9 +205,9 @@ def train():
             n_call = (t_cat == 1).sum().item()
             n_bet = (t_cat == 2).sum().item()
             
-            print(f"Iter {i} | Loss: {loss.item():.4f} | Adv: {t_adv.mean():.4f}")
-            print(f"Stats: Fold {n_fold/total_acts:.2f} | Call {n_call/total_acts:.2f} | Bet {n_bet/total_acts:.2f}")
-            print(f"Mode: {opp_pool.mode} | Bet Ratio: {bet_ratio:.2f}")
+            print(f"iter {i} | loss: {loss.item():.4f} | adv: {t_adv.mean():.4f}")
+            print(f"stats: fold {n_fold/total_acts:.2f} | call {n_call/total_acts:.2f} | bet {n_bet/total_acts:.2f}")
+            print(f"mode: {opp_pool.mode}")
 
         if i % 100 == 0:
             torch.save(policy.state_dict(), "poker_model.pt")

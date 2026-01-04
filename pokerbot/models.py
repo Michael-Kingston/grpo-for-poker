@@ -7,15 +7,13 @@ from .config import STATIC_DIM
 class DynamicPokerLSTM(nn.Module):
     def __init__(self):
         super().__init__()
-        
+        # networks
         self.static_net = nn.Sequential(nn.Linear(STATIC_DIM, 128), nn.ReLU())
         self.lstm = nn.LSTM(1, 128, batch_first=True)
         self.shared_fc = nn.Sequential(nn.Linear(256, 128), nn.ReLU())
         
-        # discrete category
+        # heads
         self.category_head = nn.Linear(128, 3)
-        
-        # continuous beta parameters
         self.amount_alpha = nn.Sequential(nn.Linear(128, 1), nn.Softplus())
         self.amount_beta =  nn.Sequential(nn.Linear(128, 1), nn.Softplus())
         
@@ -23,6 +21,7 @@ class DynamicPokerLSTM(nn.Module):
         self.lstm.flatten_parameters()
         static = self.static_net(obs[:, :STATIC_DIM])
         
+        # history
         hist = obs[:, STATIC_DIM:].unsqueeze(-1)
         _, (h_n, _) = self.lstm(hist)
         hist_feat = h_n[-1]
@@ -30,36 +29,42 @@ class DynamicPokerLSTM(nn.Module):
         combined = torch.cat([static, hist_feat], dim=1)
         latent = self.shared_fc(combined)
         
+        # logits
         cat_logits = self.category_head(latent)
         if mask is not None:
             cat_logits = cat_logits.masked_fill(mask == 0, -1e9)
             
-        # valid beta shapes
+        # beta params
         alpha = self.amount_alpha(latent) + 1.0
         beta = self.amount_beta(latent) + 1.0
         
         return cat_logits, alpha, beta
         
-    def get_action(self, obs, mask):
+    def get_action(self, obs, mask, temperature=1.0):
         if obs.dim() == 1: 
             obs = obs.unsqueeze(0)
             mask = mask.unsqueeze(0)
         
-        cat_logits, alpha, beta = self.forward(obs, mask)
+        with torch.inference_mode():
+            cat_logits, alpha, beta = self.forward(obs, mask)
         
-        # sample category
+        # temperature
+        cat_logits = cat_logits / max(temperature, 1e-6)
         cat_probs = F.softmax(cat_logits, dim=-1)
         cat_dist = dist.Categorical(cat_probs)
         cat_action = cat_dist.sample()
         
-        # sample amount
+        # beta behavior
+        alpha = (alpha - 1.0) / max(temperature, 1e-6) + 1.0
+        beta = (beta - 1.0) / max(temperature, 1e-6) + 1.0
+        
         amt_dist = dist.Beta(alpha, beta)
         amt_action = amt_dist.sample()
         
-        # stability clamp
+        # stability
         amt_action = torch.clamp(amt_action, 1e-6, 1.0 - 1e-6)
         
-        # joint log prob
+        # log prob
         log_prob_cat = cat_dist.log_prob(cat_action)
         log_prob_amt = amt_dist.log_prob(amt_action).squeeze(-1)
         

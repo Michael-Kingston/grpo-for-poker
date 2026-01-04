@@ -6,12 +6,11 @@ import torch.nn.functional as F
 from pokerbot.config import DEVICE, STATIC_DIM
 from pokerbot.models import DynamicPokerLSTM
 from pokerbot.poker_env import PokerState
-
 from pokerbot.utils import card_to_str
 
 def print_game_state(env, human_idx=1):
     print("\n" + "="*40)
-    # pot board
+    # state
     board_str = " ".join([card_to_str(c) for c in env.board])
     if not board_str: board_str = "empty"
     print(f"POT: {env.pot:.2f}  |  BOARD: {board_str}")
@@ -22,7 +21,7 @@ def print_game_state(env, human_idx=1):
     print(f"BOT Stack: {env.stacks[bot_idx]:.2f}  |  In Front: {env.chips_in_front[bot_idx]:.2f}")
     print(f"YOU Stack: {env.stacks[human_idx]:.2f}  |  In Front: {env.chips_in_front[human_idx]:.2f}")
     
-    # human hand
+    # hand
     hand_str = " ".join([card_to_str(c) for c in env.cards[human_idx]])
     print(f"YOUR HAND: [{hand_str}]")
     print("="*40)
@@ -60,7 +59,7 @@ def get_human_action(env, p_idx):
             except ValueError: continue
             if amt_input < min_bet_amt or amt_input > max_bet_amt: continue
                 
-            # frac conversion
+            # frac
             frac = 1.0 if max_bet_amt - min_bet_amt < 1e-9 else (amt_input - min_bet_amt) / (max_bet_amt - min_bet_amt)
             return 2, frac
         print("Invalid choice.")

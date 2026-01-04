@@ -1,19 +1,19 @@
 import torch
 
-# device config
+# device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # grpo config
 GROUP_SIZE = 32
-BATCH_SIZE = 64
-PPO_EPOCHS = 4
+BATCH_SIZE = 512
+PPO_EPOCHS = 10
 CLIP_EPS = 0.2
-ENTROPY_COEFF = 0.02
+ENTROPY_COEFF = 0.05
 LR = 3e-4
 
 # obs config
-MAX_HISTORY = 20 # round history
-STATIC_DIM = 131 # hole + board + numeric
+MAX_HISTORY = 20
+STATIC_DIM = 135
 TOTAL_OBS_DIM = STATIC_DIM + MAX_HISTORY
 
 # game config
