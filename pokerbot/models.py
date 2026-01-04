@@ -2,20 +2,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as dist
-from .config import STATIC_DIM
+from .config import STATIC_DIM, HIDDEN_DIM
 
 class DynamicPokerLSTM(nn.Module):
     def __init__(self):
         super().__init__()
         # networks
-        self.static_net = nn.Sequential(nn.Linear(STATIC_DIM, 128), nn.ReLU())
-        self.lstm = nn.LSTM(1, 128, batch_first=True)
-        self.shared_fc = nn.Sequential(nn.Linear(256, 128), nn.ReLU())
+        self.static_net = nn.Sequential(nn.Linear(STATIC_DIM, HIDDEN_DIM), nn.ReLU())
+        self.lstm = nn.LSTM(1, HIDDEN_DIM, batch_first=True)
+        self.shared_fc = nn.Sequential(nn.Linear(HIDDEN_DIM * 2, HIDDEN_DIM), nn.ReLU())
         
         # heads
-        self.category_head = nn.Linear(128, 3)
-        self.amount_alpha = nn.Sequential(nn.Linear(128, 1), nn.Softplus())
-        self.amount_beta =  nn.Sequential(nn.Linear(128, 1), nn.Softplus())
+        self.category_head = nn.Linear(HIDDEN_DIM, 3)
+        self.amount_alpha = nn.Sequential(nn.Linear(HIDDEN_DIM, 1), nn.Softplus())
+        self.amount_beta =  nn.Sequential(nn.Linear(HIDDEN_DIM, 1), nn.Softplus())
         
     def forward(self, obs, mask=None):
         self.lstm.flatten_parameters()
@@ -32,7 +32,7 @@ class DynamicPokerLSTM(nn.Module):
         # logits
         cat_logits = self.category_head(latent)
         if mask is not None:
-            cat_logits = cat_logits.masked_fill(mask == 0, -1e9)
+            cat_logits = cat_logits.masked_fill(mask == 0, -3e4)
             
         # beta params
         alpha = self.amount_alpha(latent) + 1.0

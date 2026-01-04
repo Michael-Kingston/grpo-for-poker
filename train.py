@@ -59,165 +59,122 @@ class OpponentPool:
 def collect_group_trajectories(policy, env, opp_pool):
     # plays until hero decision then multiverse
     buffer = []
-    
     env.reset()
     curr = 0 
     
-    # until decision (sequential)
+    # sequential until hero decision
     while not env.finished:
+        if curr == 0: break
         obs = env.get_obs(curr).to(DEVICE)
         mask = env.get_mask(curr).to(DEVICE)
-        
-        if curr == 0: 
-            break
-        else: 
-            c_opp, a_opp = opp_pool.get_action(obs, mask, policy, env, curr)
-            env.step(curr, c_opp, a_opp)
-            curr = 1 - curr
+        c, a = opp_pool.get_action(obs, mask, policy, env, curr)
+        env.step(curr, c, a)
+        curr = 1 - curr
             
-    if env.finished:
-        return [] 
+    if env.finished: return [] 
         
-    # multiverse (vectorized)
+    # multiverse (vectorised)
     snapshot = env.save_state()
-    
-    # initial sampling
-    obs_b = snapshot.get_obs(0).to(DEVICE).unsqueeze(0)
-    mask_b = snapshot.get_mask(0).to(DEVICE).unsqueeze(0)
+    obs_b = snapshot.get_obs(0).to(DEVICE)
+    mask_b = snapshot.get_mask(0).to(DEVICE)
     
     with torch.inference_mode():
-        logits_b, alpha_b, beta_b = policy(obs_b, mask_b)
+        logits_b, alpha_b, beta_b = policy(obs_b.unsqueeze(0), mask_b.unsqueeze(0))
+        # fully squeeze to scalars for the distributions
+        l_b = logits_b.squeeze(0)
+        a_b = alpha_b.view(-1)[0]
+        b_b = beta_b.view(-1)[0]
         
-        # temp
-        temp = 1.5
-        logits_b = logits_b / max(temp, 1e-6)
-        alpha_b = (alpha_b - 1.0) / max(temp, 1e-6) + 1.0
-        beta_b = (beta_b - 1.0) / max(temp, 1e-6) + 1.0
+        cat_dist = dist.Categorical(logits=l_b)
+        amt_dist = dist.Beta(a_b, b_b)
         
-        # dists
-        cat_dist = dist.Categorical(F.softmax(logits_b, dim=-1))
-        amt_dist = dist.Beta(alpha_b, beta_b)
+        # sample initial multiverse actions
+        cat_actions = cat_dist.sample((GROUP_SIZE,))
+        amt_actions = amt_dist.sample((GROUP_SIZE,))
         
-        # sampling
-        cat_actions = cat_dist.sample((GROUP_SIZE,)).squeeze()
-        amt_actions = amt_dist.sample((GROUP_SIZE,)).squeeze()
-        
-        # lps
-        lp_cats = cat_dist.log_prob(cat_actions).squeeze()
-        lp_amts = amt_dist.log_prob(amt_actions).squeeze()
+        # log probs
+        lp_cats = cat_dist.log_prob(cat_actions)
+        lp_amts = amt_dist.log_prob(amt_actions)
         is_bet_b = (cat_actions == 2).float()
         total_lps = lp_cats + (lp_amts * is_bet_b)
         
     # setup environments
     sim_envs = [snapshot.save_state() for _ in range(GROUP_SIZE)]
-    for i, s_env in enumerate(sim_envs):
-        s_env.step(0, cat_actions[i].item(), amt_actions[i].item())
+    for i in range(GROUP_SIZE):
+        sim_envs[i].step(0, cat_actions[i].item(), amt_actions[i].item())
         
     # parallel rollout
-    p_turn = 1 # next is opp
-    while any(not e.finished for e in sim_envs):
-        active_indices = [i for i, e in enumerate(sim_envs) if not e.finished]
-        if not active_indices: break
+    p_turn = 1 
+    while True:
+        # get active envs
+        active = [(i, e) for i, e in enumerate(sim_envs) if not e.finished]
+        if not active: break
         
-        active_envs = [sim_envs[i] for i in active_indices]
-        # batch transfer: stack on CPU, move ONCE to DEVICE
-        obs_batch = torch.stack([e.get_obs(p_turn) for e in active_envs]).to(DEVICE)
-        mask_batch = torch.stack([e.get_mask(p_turn) for e in active_envs]).to(DEVICE)
-        
-        next_actions = [] 
+        # batch transfer (stacking is okay for 64 items)
+        obs_batch = torch.stack([e.get_obs(p_turn) for i, e in active]).to(DEVICE)
+        mask_batch = torch.stack([e.get_mask(p_turn) for i, e in active]).to(DEVICE)
+        num_active = len(active)
         
         if p_turn == 1: # opp
-            # opp pool logic - batch the self-play ones
-            next_actions_map = {} # env_idx -> (cat, amt, none)
+            is_bootcamp = (opp_pool.mode == "bootcamp")
+            needs_self = []
             
-            # 1. identify who needs what
-            needs_self = [] 
-            needs_other = [] # (env_idx, action_type)
-            
-            for i, env_idx in enumerate(active_indices):
+            # identification loop (fast)
+            for j in range(num_active):
                 r = random.random()
-                if opp_pool.mode == "bootcamp":
-                    if r < 0.2: needs_self.append(i)
-                    else: needs_other.append((i, "fish"))
+                env = active[j][1]
+                
+                # logic branching
+                if is_bootcamp:
+                    if r < 0.2: needs_self.append(j)
+                    else:
+                        m = mask_batch[j]
+                        c = 1 if m[1] == 1 else (0 if m[0] == 1 else 1)
+                        env.step(p_turn, c, 0.0)
                 else: # normal
-                    if r < 0.1: needs_other.append((i, "fish"))
-                    elif r < 0.35 and len(opp_pool.historical) > 0:
-                        needs_other.append((i, "ghost"))
-                    else: needs_self.append(i)
+                    if r < 0.1: # fish
+                        m = mask_batch[j]
+                        c = 1 if m[1] == 1 else (0 if m[0] == 1 else 1)
+                        env.step(p_turn, c, 0.0)
+                    elif r < 0.35 and opp_pool.historical:
+                        opp_policy = random.choice(opp_pool.historical)
+                        with torch.no_grad():
+                            c, a, _ = opp_policy.get_action(obs_batch[j], mask_batch[j])
+                        env.step(p_turn, c, a)
+                    else:
+                        needs_self.append(j)
             
-            # 2. handle others sequentially (small subset)
-            for i, o_type in needs_other:
-                env_idx = active_indices[i]
-                if o_type == "fish":
-                    mask = mask_batch[i]
-                    if mask[1] == 1: c, a = 1, 0.0
-                    elif mask[0] == 1: c, a = 0, 0.0
-                    else: c, a = 1, 0.0
-                else: # ghost
-                    opp_policy = random.choice(opp_pool.historical)
-                    with torch.no_grad():
-                        c, a, _ = opp_policy.get_action(obs_batch[i], mask_batch[i])
-                next_actions_map[i] = (c, a, None)
-                
-            # 3. handle self-play in batch
             if needs_self:
-                self_obs = obs_batch[needs_self]
-                self_mask = mask_batch[needs_self]
                 with torch.inference_mode():
-                    c_logits, alpha, beta = policy(self_obs, self_mask)
-                    c_dist = dist.Categorical(F.softmax(c_logits, dim=-1))
-                    c_act = c_dist.sample()
-                    a_dist = dist.Beta(alpha, beta)
-                    a_act = a_dist.sample()
-                    
-                    for j, i in enumerate(needs_self):
-                        next_actions_map[i] = (c_act[j].item(), a_act[j].item(), None)
-            
-            # collate in original order
-            for i in range(len(active_indices)):
-                next_actions.append(next_actions_map[i])
-                
+                    c_l, alpha, beta = policy(obs_batch[needs_self], mask_batch[needs_self])
+                    c_act = dist.Categorical(logits=c_l).sample()
+                    a_act = dist.Beta(alpha, beta).sample()
+                    for k, j in enumerate(needs_self):
+                        active[j][1].step(p_turn, c_act[k].item(), a_act[k].item())
         else: # hero
             with torch.inference_mode():
-                # batched hero call
-                c_logits, alpha, beta = policy(obs_batch, mask_batch)
-                
-                # temp 1.0
-                c_probs = F.softmax(c_logits, dim=-1)
-                c_dist = dist.Categorical(c_probs)
-                c_act = c_dist.sample()
-                
-                a_dist = dist.Beta(alpha, beta)
-                a_act = a_dist.sample()
-                
-                for j in range(len(active_indices)):
-                    next_actions.append((c_act[j].item(), a_act[j].item(), None))
+                c_l, alpha, beta = policy(obs_batch, mask_batch)
+                c_act = dist.Categorical(logits=c_l).sample()
+                a_act = dist.Beta(alpha, beta).sample()
+                for j in range(num_active):
+                    active[j][1].step(p_turn, c_act[j].item(), a_act[j].item())
                     
-        # apply
-        for j, idx in enumerate(active_indices):
-            c_a, a_a, _ = next_actions[j]
-            sim_envs[idx].step(p_turn, c_a, a_a)
-            
         p_turn = 1 - p_turn
 
     # results
-    group_results = []
-    for i in range(GROUP_SIZE):
-        reward = sim_envs[i].get_payoff(0)
-        # obs/mask here should be on DEVICE 
-        # (originally hero decision point obs, which we have as obs_b)
-        group_results.append({
-            'obs': obs_b.squeeze(0), 'mask': mask_b.squeeze(0), 'cat': cat_actions[i].item(), 'amt': amt_actions[i].item(), 'lp': total_lps[i], 'reward': reward
-        })
-        
-    # advantages
-    rewards = torch.tensor([r['reward'] for r in group_results], device=DEVICE)
+    group_results_reward = [e.get_payoff(0) for e in sim_envs]
+    rewards = torch.tensor(group_results_reward, device=DEVICE)
     mean = rewards.mean()
     std = rewards.std() + 1e-6
     advantages = (rewards - mean) / std
+    adv_cpu = advantages.cpu()
     
-    for i, res in enumerate(group_results):
-        buffer.append(StepData(res['obs'], res['mask'], res['cat'], res['amt'], res['lp'], advantages[i].item()))
+    # hero decision point tensors
+    o_fixed = obs_b.squeeze(0)
+    m_fixed = mask_b.squeeze(0)
+    
+    for i in range(GROUP_SIZE):
+        buffer.append(StepData(o_fixed, m_fixed, cat_actions[i].item(), amt_actions[i].item(), total_lps[i], adv_cpu[i].item()))
         
     return buffer
 
@@ -238,26 +195,34 @@ def train():
         if i % 50 == 0:
             opp_pool.snapshot(policy)
             
-        buffer_obs, buffer_mask, buffer_cat, buffer_amt, buffer_lp, buffer_adv = [], [], [], [], [], []
+        # pre-allocated buffers for speed
+        b_obs = []
+        b_mask = []
+        b_cat = []
+        b_amt = []
+        b_lp = []
+        b_adv = []
         
-        # batching
-        while len(buffer_obs) < BATCH_SIZE:
+        # collection
+        while len(b_obs) < BATCH_SIZE:
             trajs = collect_group_trajectories(policy, env, opp_pool)
             for step in trajs:
-                buffer_obs.append(step.obs)
-                buffer_mask.append(step.mask)
-                buffer_cat.append(step.cat_action)
-                buffer_amt.append(step.amt_action)
-                buffer_lp.append(step.log_prob)
-                buffer_adv.append(step.reward) 
+                b_obs.append(step.obs)
+                b_mask.append(step.mask)
+                b_cat.append(step.cat_action)
+                b_amt.append(step.amt_action)
+                b_lp.append(step.log_prob)
+                b_adv.append(step.reward) # grpo stores advantage in reward field
         
-        t_obs = torch.stack(buffer_obs)
-        t_mask = torch.stack(buffer_mask)
-        t_cat = torch.tensor(buffer_cat, device=DEVICE)
-        t_amt = torch.tensor(buffer_amt, device=DEVICE).unsqueeze(-1)
-        t_old_lp = torch.stack(buffer_lp).detach()
-        t_adv = torch.tensor(buffer_adv, device=DEVICE).detach()
+        # batch preparation
+        t_obs = torch.stack(b_obs[:BATCH_SIZE])
+        t_mask = torch.stack(b_mask[:BATCH_SIZE])
+        t_cat = torch.tensor(b_cat[:BATCH_SIZE], device=DEVICE)
+        t_amt = torch.tensor(b_amt[:BATCH_SIZE], device=DEVICE).unsqueeze(-1)
+        t_old_lp = torch.stack(b_lp[:BATCH_SIZE]).detach()
+        t_adv = torch.tensor(b_adv[:BATCH_SIZE], device=DEVICE).detach()
         
+        # ppo update 
         for _ in range(PPO_EPOCHS):
             cat_logits, alpha, beta = policy(t_obs, t_mask)
             

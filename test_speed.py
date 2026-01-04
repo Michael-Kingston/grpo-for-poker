@@ -9,7 +9,10 @@ def test_speed():
     env = PokerState()
     opp_pool = OpponentPool()
     
-    print("Collecting 10 groups...")
+    # benchmark bootcamp mode
+    opp_pool.mode = "bootcamp"
+    
+    print("Collecting 10 groups (Bootcamp Mode)...")
     start = time.time()
     for _ in range(10):
         collect_group_trajectories(policy, env, opp_pool)

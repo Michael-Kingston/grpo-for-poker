@@ -118,7 +118,7 @@ class PokerState:
             obs[131] = self.stacks[p_idx]
             
         # mask
-        mask = self.get_mask(p_idx).cpu()
+        mask = self.get_mask(p_idx)
         obs[132:135] = mask
 
         # history
