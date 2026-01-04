@@ -9,10 +9,11 @@ def test_speed():
     env = PokerState()
     opp_pool = OpponentPool()
     
-    # benchmark bootcamp mode
-    opp_pool.mode = "bootcamp"
+    # benchmark normal mode with ghosts (the bottleneck)
+    opp_pool.mode = "normal"
+    opp_pool.historical.append(DynamicPokerLSTM().to("cuda"))
     
-    print("Collecting 10 groups (Bootcamp Mode)...")
+    print("Collecting 10 groups (Normal Mode with Ghosts)...")
     start = time.time()
     for _ in range(10):
         collect_group_trajectories(policy, env, opp_pool)

@@ -20,41 +20,33 @@ class OpponentPool:
     def snapshot(self, policy):
         self.historical.append(copy.deepcopy(policy))
         
-    def get_action(self, obs, mask, policy, env, p_idx):
-        # bootcamp
+    def pick_strategy(self):
+        # returns (type, policy_obj_or_none)
+        r = random.random()
         if self.mode == "bootcamp":
-            # 20% self-play mix
-            if random.random() < 0.2:
-                with torch.no_grad():
-                    c, a, _ = policy.get_action(obs, mask)
-                return c, a
-            
-            # 80% fish
-            if mask[1] == 1:
-                return 1, 0.0 
-            elif mask[0] == 1:
-                return 0, 0.0 
-            return 1, 0.0
-            
-        # normal
-        else:
-            r = random.random()
-            # weak (10%)
-            if r < 0.1:
-                if mask[1] == 1: return 1, 0.0
-                return 0, 0.0
-            
-            # historic (25%)
-            if r < 0.35 and len(self.historical) > 0:
-                opp_policy = random.choice(self.historical)
-                with torch.no_grad():
-                    c, a, _ = opp_policy.get_action(obs, mask)
-                return c, a
-                
-            # current self (65%)
+            if r < 0.2: return "self", None
+            return "fish", None
+        else: # normal
+            if r < 0.1: return "fish", None
+            if r < 0.35 and self.historical:
+                return "ghost", random.choice(self.historical)
+            return "self", None
+
+    def get_strategy_action(self, strategy, policy, obs, mask):
+        # strategy is (type, ghost_obj)
+        s_type, ghost = strategy
+        if s_type == "self":
             with torch.no_grad():
                 c, a, _ = policy.get_action(obs, mask)
             return c, a
+        elif s_type == "ghost":
+            with torch.no_grad():
+                c, a, _ = ghost.get_action(obs, mask)
+            return c, a
+        else: # fish
+            if mask[1] == 1: return 1, 0.0
+            if mask[0] == 1: return 0, 0.0
+            return 1, 0.0
 
 def collect_group_trajectories(policy, env, opp_pool):
     # plays until hero decision then multiverse
@@ -62,12 +54,15 @@ def collect_group_trajectories(policy, env, opp_pool):
     env.reset()
     curr = 0 
     
+    # lock in opponent for this hand
+    strategy = opp_pool.pick_strategy()
+    
     # sequential until hero decision
     while not env.finished:
         if curr == 0: break
         obs = env.get_obs(curr).to(DEVICE)
         mask = env.get_mask(curr).to(DEVICE)
-        c, a = opp_pool.get_action(obs, mask, policy, env, curr)
+        c, a = opp_pool.get_strategy_action(strategy, policy, obs, mask)
         env.step(curr, c, a)
         curr = 1 - curr
             
@@ -105,59 +100,45 @@ def collect_group_trajectories(policy, env, opp_pool):
         
     # parallel rollout
     p_turn = 1 
+    s_type, ghost = strategy
+    
     while True:
         # get active envs
-        active = [(i, e) for i, e in enumerate(sim_envs) if not e.finished]
+        active = [e for e in sim_envs if not e.finished]
         if not active: break
         
-        # batch transfer (stacking is okay for 64 items)
-        obs_batch = torch.stack([e.get_obs(p_turn) for i, e in active]).to(DEVICE)
-        mask_batch = torch.stack([e.get_mask(p_turn) for i, e in active]).to(DEVICE)
         num_active = len(active)
+        # batch transfer
+        obs_batch = torch.stack([e.get_obs(p_turn) for e in active]).to(DEVICE)
+        mask_batch = torch.stack([e.get_mask(p_turn) for e in active]).to(DEVICE)
         
         if p_turn == 1: # opp
-            is_bootcamp = (opp_pool.mode == "bootcamp")
-            needs_self = []
-            
-            # identification loop (fast)
-            for j in range(num_active):
-                r = random.random()
-                env = active[j][1]
-                
-                # logic branching
-                if is_bootcamp:
-                    if r < 0.2: needs_self.append(j)
-                    else:
-                        m = mask_batch[j]
-                        c = 1 if m[1] == 1 else (0 if m[0] == 1 else 1)
-                        env.step(p_turn, c, 0.0)
-                else: # normal
-                    if r < 0.1: # fish
-                        m = mask_batch[j]
-                        c = 1 if m[1] == 1 else (0 if m[0] == 1 else 1)
-                        env.step(p_turn, c, 0.0)
-                    elif r < 0.35 and opp_pool.historical:
-                        opp_policy = random.choice(opp_pool.historical)
-                        with torch.no_grad():
-                            c, a, _ = opp_policy.get_action(obs_batch[j], mask_batch[j])
-                        env.step(p_turn, c, a)
-                    else:
-                        needs_self.append(j)
-            
-            if needs_self:
-                with torch.inference_mode():
-                    c_l, alpha, beta = policy(obs_batch[needs_self], mask_batch[needs_self])
+            if s_type == "fish":
+                for env_idx in range(num_active):
+                    m = mask_batch[env_idx]
+                    c = 1 if m[1] == 1 else (0 if m[0] == 1 else 1)
+                    active[env_idx].step(p_turn, c, 0.0)
+            elif s_type == "ghost":
+                with torch.no_grad():
+                    c_l, alpha, beta = ghost(obs_batch, mask_batch)
                     c_act = dist.Categorical(logits=c_l).sample()
                     a_act = dist.Beta(alpha, beta).sample()
-                    for k, j in enumerate(needs_self):
-                        active[j][1].step(p_turn, c_act[k].item(), a_act[k].item())
+                    for j in range(num_active):
+                        active[j].step(p_turn, c_act[j].item(), a_act[j].item())
+            else: # self
+                with torch.inference_mode():
+                    c_l, alpha, beta = policy(obs_batch, mask_batch)
+                    c_act = dist.Categorical(logits=c_l).sample()
+                    a_act = dist.Beta(alpha, beta).sample()
+                    for j in range(num_active):
+                        active[j].step(p_turn, c_act[j].item(), a_act[j].item())
         else: # hero
             with torch.inference_mode():
                 c_l, alpha, beta = policy(obs_batch, mask_batch)
                 c_act = dist.Categorical(logits=c_l).sample()
                 a_act = dist.Beta(alpha, beta).sample()
                 for j in range(num_active):
-                    active[j][1].step(p_turn, c_act[j].item(), a_act[j].item())
+                    active[j].step(p_turn, c_act[j].item(), a_act[j].item())
                     
         p_turn = 1 - p_turn
 
