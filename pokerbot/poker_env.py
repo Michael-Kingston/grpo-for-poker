@@ -128,10 +128,10 @@ class PokerState:
             for i, (cat, amt) in enumerate(relevant):
                 val = 0.33 if cat == 0 else (0.66 if cat == 1 else 1.0)
                 obs[start + i] = val
-        return obs.to(DEVICE)
+        return obs
 
     def get_mask(self, p_idx):
-        mask = torch.ones(3, device=DEVICE)
+        mask = torch.ones(3)
         opp_idx = 1 - p_idx
         to_call = self.chips_in_front[opp_idx] - self.chips_in_front[p_idx]
         if to_call <= 0.01: mask[0] = 0 # no fold on check

@@ -63,10 +63,10 @@ def collect_group_trajectories(policy, env, opp_pool):
     env.reset()
     curr = 0 
     
-    # until decision
+    # until decision (sequential)
     while not env.finished:
-        obs = env.get_obs(curr)
-        mask = env.get_mask(curr)
+        obs = env.get_obs(curr).to(DEVICE)
+        mask = env.get_mask(curr).to(DEVICE)
         
         if curr == 0: 
             break
@@ -78,27 +78,27 @@ def collect_group_trajectories(policy, env, opp_pool):
     if env.finished:
         return [] 
         
-    # multiverse
+    # multiverse (vectorized)
     snapshot = env.save_state()
-    group_results = []
     
-    obs_b = snapshot.get_obs(0).unsqueeze(0)
-    mask_b = snapshot.get_mask(0).unsqueeze(0)
+    # initial sampling
+    obs_b = snapshot.get_obs(0).to(DEVICE).unsqueeze(0)
+    mask_b = snapshot.get_mask(0).to(DEVICE).unsqueeze(0)
     
-    # inference mode faster
     with torch.inference_mode():
         logits_b, alpha_b, beta_b = policy(obs_b, mask_b)
         
         # temp
-        logits_b = logits_b / max(1.5, 1e-6)
-        alpha_b = (alpha_b - 1.0) / max(1.5, 1e-6) + 1.0
-        beta_b = (beta_b - 1.0) / max(1.5, 1e-6) + 1.0
+        temp = 1.5
+        logits_b = logits_b / max(temp, 1e-6)
+        alpha_b = (alpha_b - 1.0) / max(temp, 1e-6) + 1.0
+        beta_b = (beta_b - 1.0) / max(temp, 1e-6) + 1.0
         
         # dists
         cat_dist = dist.Categorical(F.softmax(logits_b, dim=-1))
         amt_dist = dist.Beta(alpha_b, beta_b)
         
-        # batched sampling faster
+        # sampling
         cat_actions = cat_dist.sample((GROUP_SIZE,)).squeeze()
         amt_actions = amt_dist.sample((GROUP_SIZE,)).squeeze()
         
@@ -108,32 +108,106 @@ def collect_group_trajectories(policy, env, opp_pool):
         is_bet_b = (cat_actions == 2).float()
         total_lps = lp_cats + (lp_amts * is_bet_b)
         
-    for i in range(GROUP_SIZE):
-        sim_env = snapshot.save_state()
+    # setup environments
+    sim_envs = [snapshot.save_state() for _ in range(GROUP_SIZE)]
+    for i, s_env in enumerate(sim_envs):
+        s_env.step(0, cat_actions[i].item(), amt_actions[i].item())
         
-        c_act = cat_actions[i].item()
-        a_act = amt_actions[i].item()
-        lp = total_lps[i]
+    # parallel rollout
+    p_turn = 1 # next is opp
+    while any(not e.finished for e in sim_envs):
+        active_indices = [i for i, e in enumerate(sim_envs) if not e.finished]
+        if not active_indices: break
         
-        sim_env.step(0, c_act, a_act)
+        active_envs = [sim_envs[i] for i in active_indices]
+        # batch transfer: stack on CPU, move ONCE to DEVICE
+        obs_batch = torch.stack([e.get_obs(p_turn) for e in active_envs]).to(DEVICE)
+        mask_batch = torch.stack([e.get_mask(p_turn) for e in active_envs]).to(DEVICE)
         
-        p_turn = 1
-        while not sim_env.finished:
-            s_obs = sim_env.get_obs(p_turn)
-            s_mask = sim_env.get_mask(p_turn)
+        next_actions = [] 
+        
+        if p_turn == 1: # opp
+            # opp pool logic - batch the self-play ones
+            next_actions_map = {} # env_idx -> (cat, amt, none)
             
-            if p_turn == 1: # opp
-                c_o, a_o = opp_pool.get_action(s_obs, s_mask, policy, sim_env, p_turn)
-                sim_env.step(p_turn, c_o, a_o)
-            else: # hero
+            # 1. identify who needs what
+            needs_self = [] 
+            needs_other = [] # (env_idx, action_type)
+            
+            for i, env_idx in enumerate(active_indices):
+                r = random.random()
+                if opp_pool.mode == "bootcamp":
+                    if r < 0.2: needs_self.append(i)
+                    else: needs_other.append((i, "fish"))
+                else: # normal
+                    if r < 0.1: needs_other.append((i, "fish"))
+                    elif r < 0.35 and len(opp_pool.historical) > 0:
+                        needs_other.append((i, "ghost"))
+                    else: needs_self.append(i)
+            
+            # 2. handle others sequentially (small subset)
+            for i, o_type in needs_other:
+                env_idx = active_indices[i]
+                if o_type == "fish":
+                    mask = mask_batch[i]
+                    if mask[1] == 1: c, a = 1, 0.0
+                    elif mask[0] == 1: c, a = 0, 0.0
+                    else: c, a = 1, 0.0
+                else: # ghost
+                    opp_policy = random.choice(opp_pool.historical)
+                    with torch.no_grad():
+                        c, a, _ = opp_policy.get_action(obs_batch[i], mask_batch[i])
+                next_actions_map[i] = (c, a, None)
+                
+            # 3. handle self-play in batch
+            if needs_self:
+                self_obs = obs_batch[needs_self]
+                self_mask = mask_batch[needs_self]
                 with torch.inference_mode():
-                    c_o, a_o, _ = policy.get_action(s_obs, s_mask, temperature=1.0)
-                sim_env.step(p_turn, c_o, a_o)
-            p_turn = 1 - p_turn
+                    c_logits, alpha, beta = policy(self_obs, self_mask)
+                    c_dist = dist.Categorical(F.softmax(c_logits, dim=-1))
+                    c_act = c_dist.sample()
+                    a_dist = dist.Beta(alpha, beta)
+                    a_act = a_dist.sample()
+                    
+                    for j, i in enumerate(needs_self):
+                        next_actions_map[i] = (c_act[j].item(), a_act[j].item(), None)
             
-        reward = sim_env.get_payoff(0)
+            # collate in original order
+            for i in range(len(active_indices)):
+                next_actions.append(next_actions_map[i])
+                
+        else: # hero
+            with torch.inference_mode():
+                # batched hero call
+                c_logits, alpha, beta = policy(obs_batch, mask_batch)
+                
+                # temp 1.0
+                c_probs = F.softmax(c_logits, dim=-1)
+                c_dist = dist.Categorical(c_probs)
+                c_act = c_dist.sample()
+                
+                a_dist = dist.Beta(alpha, beta)
+                a_act = a_dist.sample()
+                
+                for j in range(len(active_indices)):
+                    next_actions.append((c_act[j].item(), a_act[j].item(), None))
+                    
+        # apply
+        for j, idx in enumerate(active_indices):
+            c_a, a_a, _ = next_actions[j]
+            sim_envs[idx].step(p_turn, c_a, a_a)
+            
+        p_turn = 1 - p_turn
+
+    # results
+    group_results = []
+    for i in range(GROUP_SIZE):
+        reward = sim_envs[i].get_payoff(0)
+        # obs/mask here should be on DEVICE 
+        # (originally hero decision point obs, which we have as obs_b)
         group_results.append({
-            'obs': obs, 'mask': mask, 'cat': c_act, 'amt': a_act, 'lp': lp, 'reward': reward
+            'obs': obs_b.squeeze(0), 'mask': mask_b.squeeze(0), 'cat': cat_actions[i].item(), 'amt': amt_actions[i].item(), 'lp': total_lps[i], 'reward': reward
         })
         
     # advantages

@@ -41,6 +41,11 @@ class DynamicPokerLSTM(nn.Module):
         return cat_logits, alpha, beta
         
     def get_action(self, obs, mask, temperature=1.0):
+        # move to device
+        device = next(self.parameters()).device
+        obs = obs.to(device)
+        mask = mask.to(device)
+        
         if obs.dim() == 1: 
             obs = obs.unsqueeze(0)
             mask = mask.unsqueeze(0)
